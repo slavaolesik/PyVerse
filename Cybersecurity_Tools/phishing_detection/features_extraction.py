@@ -1,5 +1,6 @@
 import re
 import socket
+import time
 import ssl
 import whois
 import requests
@@ -8,6 +9,35 @@ from urllib.parse import urlparse, urlencode
 from bs4 import BeautifulSoup
 import dns.resolver
 import tldextract
+
+# NetAPI domain-rank answers shared by all extractor instances: one request per registered domain
+_RANK_CACHE = {}
+
+
+def netapi_domain_rank(registered_domain):
+    """Rank of a registered domain in the NetAPI Top 1M, None when unranked or when the lookup failed.
+    Free calls without a key are limited to 30 a minute and 1,000 a day per IP: a per-minute 429 is waited
+    out once (Retry-After), the daily limit is not, and failed lookups are not cached."""
+    if registered_domain in _RANK_CACHE:
+        return _RANK_CACHE[registered_domain]
+    for attempt in range(2):
+        response = requests.get(
+            "https://netapi.com/api-json/",
+            params={"method": "domain-rank", "domain": registered_domain},
+            timeout=10,
+        )
+        if response.status_code == 429 and attempt == 0:
+            retry_after = int(response.headers.get("Retry-After", "60"))
+            if retry_after <= 60:
+                time.sleep(retry_after)
+                continue
+        break
+    if response.status_code != 200:
+        return None
+    rank = response.json().get("rank")
+    _RANK_CACHE[registered_domain] = rank
+    return rank
+
 
 class URLFeatureExtractor:
     def __init__(self, url):
@@ -260,14 +290,11 @@ class URLFeatureExtractor:
         """Check web traffic: position of the domain in the NetAPI Top 1M (the Alexa ranking was retired in 2022).
         Same scale as the training data: 1 = rank up to 100,000, 0 = ranked lower in the Top 1M, -1 = not ranked."""
         try:
-            ext = tldextract.extract(self.url)
+            # private suffixes (github.io, blogspot.com ...) keep the tenant name, so phish.github.io
+            # is looked up as itself and does not inherit the rank of the platform
+            ext = tldextract.extract(self.url, include_psl_private_domains=True)
             registered_domain = f"{ext.domain}.{ext.suffix}" if ext.suffix else self.domain
-            response = requests.get(
-                "https://netapi.com/api-json/",
-                params={"method": "domain-rank", "domain": registered_domain},
-                timeout=10,
-            )
-            rank = response.json().get("rank") if response.status_code == 200 else None
+            rank = netapi_domain_rank(registered_domain)
             if rank is None:
                 self.features['web_traffic'] = -1
             elif rank <= 100000:
