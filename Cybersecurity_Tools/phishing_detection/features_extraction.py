@@ -10,16 +10,19 @@ from bs4 import BeautifulSoup
 import dns.resolver
 import tldextract
 
-# NetAPI domain-rank answers shared by all extractor instances: one request per registered domain
+# NetAPI domain-rank answers shared by all extractor instances: one request per registered domain.
+# The Top 1M is rebuilt daily, so an entry expires after six hours and a long-running process picks up new ranks.
 _RANK_CACHE = {}
+_RANK_CACHE_TTL = 6 * 3600
 
 
 def netapi_domain_rank(registered_domain):
     """Rank of a registered domain in the NetAPI Top 1M, None when unranked or when the lookup failed.
     Free calls without a key are limited to 30 a minute and 1,000 a day per IP: a per-minute 429 is waited
     out once (Retry-After), the daily limit is not, and failed lookups are not cached."""
-    if registered_domain in _RANK_CACHE:
-        return _RANK_CACHE[registered_domain]
+    cached = _RANK_CACHE.get(registered_domain)
+    if cached is not None and time.monotonic() - cached[1] < _RANK_CACHE_TTL:
+        return cached[0]
     for attempt in range(2):
         response = requests.get(
             "https://netapi.com/api-json/",
@@ -35,7 +38,7 @@ def netapi_domain_rank(registered_domain):
     if response.status_code != 200:
         return None
     rank = response.json().get("rank")
-    _RANK_CACHE[registered_domain] = rank
+    _RANK_CACHE[registered_domain] = (rank, time.monotonic())
     return rank
 
 
